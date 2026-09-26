@@ -11,9 +11,19 @@ class WorkflowTest(unittest.TestCase):
         item=self.service.create_item({"title":"workflow item","description":"complete business flow","severity":'major',"quantity":12,"threshold":6,"external_ref":"WF-1"},"creator",'inspector')
         self.assertEqual(item["status"],STATES[0])
         self.service.add_record(item["id"],{"kind":"evidence","detail":"evidence registered","status":"closed","external_ref":"EV-1"},"recorder",'inspector')
+        crew=self.service.create_crew({"name":"seepage crew","skills":["seepage"],"external_ref":"CR-1"},"planner",'emergency_manager')
+        pump=self.service.create_equipment({"kind":"pump","name":"pump-1","external_ref":"PP-1"},"planner",'emergency_manager')
+        vehicle=self.service.create_equipment({"kind":"vehicle","name":"truck-1","external_ref":"VH-1"},"planner",'emergency_manager')
         current=item
         for target in STATES[1:]:
             current=self.service.transition(current["id"],target,current["version"],"reviewer",TRANSITION_ROLES[target][0])
+            if target=="defect_confirmed":
+                dispatch=self.service.create_dispatch(current["id"],{"skill":"seepage","start_at":"2026-09-26T08:00:00Z","end_at":"2026-09-26T12:00:00Z","pump_ids":[pump["id"]],"vehicle_ids":[vehicle["id"]]},"planner",'emergency_manager')
+                self.assertEqual(dispatch["crew_id"],crew["id"])
+                dispatch=self.service.arrive_dispatch(dispatch["id"],"lead",'dam_engineer')
+                dispatch=self.service.complete_dispatch(dispatch["id"],"lead",'dam_engineer')
+                self.assertEqual(dispatch["status"],"completed")
+                self.assertTrue(all(resource["returned"]==1 for resource in dispatch["resources"]))
         self.assertEqual(current["status"],STATES[-1])
         self.assertEqual(len(self.service.list_records(current["id"],"viewer")),1)
         events=self.service.audit("viewer",current["id"]); self.assertGreaterEqual(len(events),len(STATES)+1); self.assertTrue(self.repo.verify_audit_chain())

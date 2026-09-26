@@ -71,7 +71,12 @@ def make_handler(service: Service, static_dir: str):
                 status = 400
             else:
                 status = 500
-            self._json(status, {"error": exc.__class__.__name__, "message": str(exc)})
+            payload: Dict[str, Any] = {"error": exc.__class__.__name__,
+                                       "message": str(exc)}
+            details = getattr(exc, "details", None)
+            if details is not None:
+                payload["details"] = details
+            self._json(status, payload)
 
         def do_GET(self) -> None:
             try:
@@ -89,6 +94,26 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/dispatches"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"dispatches": service.list_dispatches(item_id, role)})
+                elif path == "/api/crews":
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"crews": service.list_crews(role)})
+                elif path == "/api/equipment":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    kind = query.get("kind", [None])[0]
+                    self._json(200, {"equipment": service.list_equipment(role, kind)})
+                elif path.startswith("/api/dispatches/"):
+                    dispatch_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_dispatch(dispatch_id, role))
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -113,6 +138,22 @@ def make_handler(service: Service, static_dir: str):
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/dispatches"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.create_dispatch(item_id, body, actor, role))
+                elif path == "/api/crews":
+                    self._json(201, service.create_crew(body, actor, role))
+                elif path == "/api/equipment":
+                    self._json(201, service.create_equipment(body, actor, role))
+                elif path.startswith("/api/dispatches/") and path.endswith("/arrive"):
+                    dispatch_id = int(path.split("/")[3])
+                    self._json(200, service.arrive_dispatch(dispatch_id, actor, role))
+                elif path.startswith("/api/dispatches/") and path.endswith("/cancel"):
+                    dispatch_id = int(path.split("/")[3])
+                    self._json(200, service.cancel_dispatch(dispatch_id, actor, role))
+                elif path.startswith("/api/dispatches/") and path.endswith("/complete"):
+                    dispatch_id = int(path.split("/")[3])
+                    self._json(200, service.complete_dispatch(dispatch_id, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/transition"):
                     item_id = int(path.split("/")[3])
                     target = body.get("target")
