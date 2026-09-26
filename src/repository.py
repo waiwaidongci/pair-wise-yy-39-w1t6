@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, ValidationError
 from .rules import ID_PREFIX, STATES
 
 
@@ -65,6 +65,46 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS crews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    skills TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS resources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    type TEXT NOT NULL CHECK(type IN ('pump','vehicle')),
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS dispatches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    crew_id INTEGER NOT NULL REFERENCES crews(id),
+                    required_skill TEXT NOT NULL,
+                    window_start TEXT NOT NULL,
+                    window_end TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK(status IN ('reserved','arrived','cancelled','completed')),
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_dispatches_item ON dispatches(item_id);
+                CREATE TABLE IF NOT EXISTS dispatch_resources (
+                    dispatch_id INTEGER NOT NULL REFERENCES dispatches(id) ON DELETE CASCADE,
+                    resource_id INTEGER NOT NULL REFERENCES resources(id),
+                    resource_type TEXT NOT NULL,
+                    returned_at TEXT,
+                    PRIMARY KEY(dispatch_id, resource_id)
+                );
+                CREATE INDEX IF NOT EXISTS ix_dispatch_resources_resource
+                    ON dispatch_resources(resource_id);
             """)
 
     @staticmethod
@@ -209,6 +249,219 @@ class Repository:
                 return False
             previous = row["entry_hash"]
         return True
+
+    # ---- 抢修班组、调度资源与处置调度 ----
+    def create_crew(self, name, skills, actor):
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    "INSERT INTO crews(name, skills, active, created_by, created_at) VALUES(?,?,1,?,?)",
+                    (name, json.dumps(skills, ensure_ascii=False), actor, now))
+                crew_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("班组名称已存在") from exc
+        return self.get_crew(crew_id)
+
+    def get_crew(self, crew_id):
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM crews WHERE id=?", (crew_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("班组不存在")
+        crew = dict(row)
+        crew["skills"] = json.loads(crew["skills"])
+        crew["active"] = bool(crew["active"])
+        return crew
+
+    def list_crews(self, active_only=True):
+        sql = "SELECT * FROM crews"
+        if active_only:
+            sql += " WHERE active=1"
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self.conn.execute(sql).fetchall()
+        result = []
+        for row in rows:
+            crew = dict(row)
+            crew["skills"] = json.loads(crew["skills"])
+            crew["active"] = bool(crew["active"])
+            result.append(crew)
+        return result
+
+    def create_resource(self, name, rtype, actor):
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO resources(name, type, active, created_by, created_at) VALUES(?,?,1,?,?)",
+                (name, rtype, actor, now))
+            resource_id = int(cur.lastrowid)
+        return self.get_resource(resource_id)
+
+    def get_resource(self, resource_id):
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM resources WHERE id=?", (resource_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("资源不存在")
+        resource = dict(row)
+        resource["active"] = bool(resource["active"])
+        return resource
+
+    def list_resources(self, rtype=None, active_only=True):
+        sql = "SELECT * FROM resources"
+        clauses, params = [], []
+        if active_only:
+            clauses.append("active=1")
+        if rtype:
+            clauses.append("type=?")
+            params.append(rtype)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
+        result = []
+        for row in rows:
+            resource = dict(row)
+            resource["active"] = bool(resource["active"])
+            result.append(resource)
+        return result
+
+    def reserve_dispatch(self, item_id, required_skill, pump_ids, vehicle_ids,
+                         window_start, window_end, actor):
+        """单事务内匹配班组并占住泵机、车辆；任一占用冲突则整笔不保存。"""
+        now = utc_now()
+        resource_ids = pump_ids + vehicle_ids
+        expected_type = {rid: "pump" for rid in pump_ids}
+        expected_type.update({rid: "vehicle" for rid in vehicle_ids})
+        with self._lock, self.conn:
+            conflicts = []
+            placeholders = ",".join("?" for _ in resource_ids)
+            rows = self.conn.execute(
+                f"""SELECT r.id, r.name, r.type, r.active,
+                           d.id AS dispatch_id, d.item_id AS item_id
+                    FROM resources r
+                    LEFT JOIN dispatch_resources dr
+                        ON dr.resource_id=r.id AND dr.returned_at IS NULL
+                    LEFT JOIN dispatches d
+                        ON d.id=dr.dispatch_id
+                           AND d.status IN ('reserved','arrived')
+                           AND d.window_start < ? AND ? < d.window_end
+                    WHERE r.id IN ({placeholders})
+                    ORDER BY r.id""",
+                (window_end, window_start, *resource_ids)).fetchall()
+            found = {int(row["id"]): row for row in rows}
+            for resource_id in resource_ids:
+                row = found.get(resource_id)
+                if row is None:
+                    raise NotFoundError(f"资源{resource_id}不存在")
+                if not row["active"]:
+                    raise ValidationError(f"资源{row['name']}已停用")
+                if row["type"] != expected_type[resource_id]:
+                    raise ValidationError(f"资源{row['name']}类型不匹配")
+                if row["dispatch_id"] is not None:
+                    conflicts.append({
+                        "kind": "resource", "resource_id": resource_id,
+                        "type": row["type"], "name": row["name"],
+                        "dispatch_id": int(row["dispatch_id"]),
+                        "item_id": int(row["item_id"]),
+                    })
+            busy_rows = self.conn.execute(
+                """SELECT crew_id FROM dispatches
+                   WHERE status IN ('reserved','arrived')
+                     AND window_start < ? AND ? < window_end
+                   GROUP BY crew_id""",
+                (window_end, window_start)).fetchall()
+            busy = {int(row["crew_id"]) for row in busy_rows}
+            candidates = [crew for crew in self.list_crews(active_only=True)
+                          if crew["id"] not in busy and required_skill in crew["skills"]]
+            if not candidates:
+                conflicts.append({"kind": "crew", "required_skill": required_skill})
+            if conflicts:
+                raise ConflictError("调度时段存在占用，整笔调度未保存", conflicts)
+            crew = candidates[0]
+            cur = self.conn.execute(
+                """INSERT INTO dispatches(item_id, crew_id, required_skill, window_start,
+                   window_end, status, version, created_by, created_at, updated_at)
+                   VALUES(?,?,?,?,?,'reserved',1,?,?,?)""",
+                (item_id, crew["id"], required_skill, window_start, window_end,
+                 actor, now, now))
+            dispatch_id = int(cur.lastrowid)
+            self.conn.executemany(
+                """INSERT INTO dispatch_resources(dispatch_id, resource_id, resource_type,
+                   returned_at) VALUES(?,?,?,NULL)""",
+                [(dispatch_id, rid, "pump") for rid in pump_ids]
+                + [(dispatch_id, rid, "vehicle") for rid in vehicle_ids])
+        return self.get_dispatch(dispatch_id)
+
+    def get_dispatch(self, dispatch_id):
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM dispatches WHERE id=?", (dispatch_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("调度不存在")
+        dispatch = dict(row)
+        dispatch["crew"] = self.get_crew(dispatch["crew_id"])
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT dr.resource_id, dr.resource_type, dr.returned_at, r.name
+                   FROM dispatch_resources dr JOIN resources r ON r.id=dr.resource_id
+                   WHERE dr.dispatch_id=? ORDER BY dr.resource_id""",
+                (dispatch_id,)).fetchall()
+        dispatch["resources"] = [
+            {"resource_id": int(r["resource_id"]), "type": r["resource_type"],
+             "name": r["name"], "returned_at": r["returned_at"]}
+            for r in rows]
+        return dispatch
+
+    def update_dispatch_status(self, dispatch_id, target, expected_version, actor):
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE dispatches SET status=?, version=version+1, updated_at=?
+                   WHERE id=? AND version=?""",
+                (target, now, dispatch_id, expected_version))
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM dispatches WHERE id=?", (dispatch_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("调度不存在")
+                raise ConflictError("调度版本冲突，请刷新后重试")
+            if target == "completed":
+                self.conn.execute(
+                    """UPDATE dispatch_resources SET returned_at=?
+                       WHERE dispatch_id=? AND returned_at IS NULL""",
+                    (now, dispatch_id))
+        return self.get_dispatch(dispatch_id)
+
+    def active_dispatch_for_item(self, item_id):
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT id FROM dispatches WHERE item_id=?
+                   AND status IN ('reserved','arrived') ORDER BY id LIMIT 1""",
+                (item_id,)).fetchone()
+        return int(row["id"]) if row else None
+
+    def has_completed_dispatch(self, item_id):
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM dispatches WHERE item_id=? AND status='completed' LIMIT 1",
+                (item_id,)).fetchone()
+        return row is not None
+
+    def list_dispatches(self, item_id=None, status=None):
+        sql = "SELECT id FROM dispatches"
+        clauses, params = [], []
+        if item_id is not None:
+            clauses.append("item_id=?")
+            params.append(item_id)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id"
+        with self._lock:
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
+        return [self.get_dispatch(int(row["id"])) for row in rows]
 
     def close(self) -> None:
         with self._lock:
